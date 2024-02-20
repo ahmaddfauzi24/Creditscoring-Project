@@ -1,0 +1,349 @@
+---
+title: 'Financial Industry: Credit Scoring'
+author: "Ahmad Fauzi"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown
+---
+
+```{r setup, include=FALSE}
+# clear-up the environment
+rm(list = ls())
+
+# chunk options
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  comment = "#>"
+)
+
+# scientific notation
+options(scipen = 9999)
+```
+
+```{r message=F, warning=F, echo=FALSE}
+library(tidyverse)
+library(rsample)
+library(tidymodels)
+library(caret)
+library(readr)
+library(inspectdf)
+library(lime)
+library(xgboost)
+library(ROCR)
+```
+## Credit Risk Analysis 
+
+### Background
+
+In the financial industry, credit scoring is the key to determining whether someone is eligible for a loan. However, the traditional process is often slow and cumbersome for potential borrowers. To overcome this, banks and financial institutions are starting to adopt machine learning technology. By analyzing borrower profile data and payment patterns, machine learning models can quickly and accurately predict credit risk. This allows banks to offer loans faster, while still reducing the risk of default. Thus, the use of machine learning in credit scoring not only improves process efficiency, but also helps optimize credit decisions and reduce operational costs.
+
+### Modelling Analysis
+
+#### Cleaning data
+```{r}
+credit <- read_csv("data_input/credit_record.csv")
+application <- read_csv("data_input/application_record.csv")
+```
+
+Data Description:
+
+**Credit**
+
+- ID : Client number	
+- MONTHS_BALANCE : Record month	The month of the extracted data is the starting point, backwards, 0 is the current month, -1 is the previous month, and so on
+- STATUS : Status	
+    - 0: 1-29 days past due 
+    - 1: 30-59 days past due 
+    - 2: 60-89 days overdue 
+    - 3: 90-119 days overdue 
+    - 4: 120-149 days overdue 
+    - 5: Overdue or bad debts, write-offs for more than 150 days 
+    - C: paid off that month 
+    - X: No loan for the month
+
+**Application**
+
+- ID	: Client number	
+- CODE_GENDER : Gender	
+- FLAG_OWN_CAR : Is there a car	
+- FLAG_OWN_REALTY ; Is there a property	
+- CNT_CHILDREN : Number of children	
+- AMT_INCOME_TOTAL : Annual income	
+- NAME_INCOME_TYPE	: Income category	
+- NAME_EDUCATION_TYPE :	Education level	
+- NAME_FAMILY_STATUS	: Marital status	
+- NAME_HOUSING_TYPE	: Way of living	
+- DAYS_BIRTH	: Birthday	Count backwards from current day (0), -1 means yesterday
+- DAYS_EMPLOYED	: Start date of employment	Count backwards from current day(0). If positive, it means - - the person currently unemployed.
+- FLAG_MOBIL	: Is there a mobile phone	
+- FLAG_WORK_PHONE	: Is there a work phone	
+- FLAG_PHONE	: Is there a phone	
+- FLAG_EMAIL	: Is there an email	
+- OCCUPATION_TYPE	: Occupation	
+- CNT_FAM_MEMBERS	:Family size
+
+**Check missing values**
+
+There are no missing values in the credit data
+```{r}
+colSums(is.na(credit))
+```
+
+```{r}
+colSums(is.na(application))
+```
+
+In the application data there is an `OCCUPATION_TYPE` variable that has a lot of missing data, we can discard the variable. Also, we will remove `DAYS_BIRTH` and `DAYS_EMPLOYED` variables that are not needed in the model.
+ 
+```{r}
+application <- application %>% 
+               select(-c(OCCUPATION_TYPE, DAYS_BIRTH, DAYS_EMPLOYED))
+```
+
+**Customizing data types**
+
+The next step is to merge the credit and application data and adjust the categorical data types that are still read as characters.
+```{r}
+data_clean <- credit %>% 
+              left_join(application) %>% 
+              na.omit() %>% 
+              select(-ID) %>% 
+              filter(STATUS != "X") %>% 
+              mutate(STATUS = as.factor(ifelse(STATUS == "C", "good credit", "bad credit"))) %>% 
+              mutate_at(.vars = c("FLAG_MOBIL", "FLAG_WORK_PHONE",
+                                  "FLAG_PHONE", "FLAG_EMAIL"), as.factor) %>% 
+              mutate_if(is.character, as.factor) %>% 
+              data.frame()
+str(data_clean)
+```
+```{r, echo=FALSE}
+data_clean <- data_clean %>% head(100000)
+```
+
+
+#### Exploratory Data Analysis (EDA)
+
+In EDA data, we want to know how categorical and numerical data are distributed. 
+```{r}
+data_clean %>% inspect_cat() %>% show_plot()
+```
+
+In the following visualization we will get information on whether there are variables that do not have much information in the data, for example, the variable `FLAG_MOBIL` where all data contains 1, meaning that all our customers who make loans have cars. Data that has no variance like this is not included in the model.
+
+```{r}
+data_clean <- data_clean %>% 
+              select(-c(FLAG_MOBIL,FLAG_EMAIL))
+```
+
+```{r}
+data_clean %>% inspect_num() %>% show_plot()
+```
+
+#### Modelling Random Forest
+
+Split train data and test data with a proportion of 80:20. The train data will be used for modeling, while the test data will be used for evaluation.
+```{r}
+set.seed(100)
+index <- initial_split(data = data_clean, prop = 0.8, strata = "STATUS")
+train <- training(index)
+test <- testing(index)
+```
+
+Check the proportion of the target variable
+```{r}
+prop.table(table(train$STATUS))
+```
+
+Shape of random forest model with 3 k-fold and 2 repetitions
+```{r}
+# set.seed(100)
+# 
+# ctrl <- trainControl(method = "repeatedcv",
+#                      number = 3, 
+#                      repeats = 2,
+#                      allowParallel=FALSE)
+# 
+# model_forest <- caret::train(STATUS ~.,
+#                              data = train, 
+#                              method = "rf", 
+#                              trControl = ctrl)
+
+#saveRDS(model_forest, "model_forest.RDS")
+
+model_forest <- readRDS("model_forest.RDS")
+```
+
+```{r}
+model_forest
+```
+
+After doing 3 repetitions on the model, the second repetition has the highest accuracy with a total of 14 mtry. 
+
+Next, predictions will be made for the test data and look for the confusion matrix value on the prediction results.
+```{r}
+pred_rf<- predict(model_forest, newdata = test, type = "prob") %>% 
+          mutate(result = as.factor(ifelse(`bad credit` > 0.45, "bad credit", "good credit")),
+                 actual = ifelse(test$STATUS == 'good credit', 0, 1))
+confmat_rf <- confusionMatrix(pred_rf$result, 
+                                 test$STATUS,
+                                 mode = "prec_recall",
+                                 positive = "bad credit")
+
+eval_rf <- tidy(confmat_rf) %>% 
+  mutate(model = "Random Forest") %>% 
+  select(model, term, estimate) %>% 
+  filter(term %in% c("accuracy", "precision", "recall", "specificity"))
+
+eval_rf
+```
+
+
+#### Modelling XGBoost
+
+The next step is to implement the data using the XGBoost model, we need to prepare the data for the XGBoost model first.
+
+```{r}
+data_xgb <- data_clean %>% 
+            mutate(STATUS = ifelse(STATUS == "good credit", 0, 1)) %>% 
+            data.frame()
+```
+
+
+```{r}
+set.seed(100)
+index <- initial_split(data = data_xgb, prop = 0.8, strata = "STATUS")
+train_xgb <- training(index)
+test_xgb <- testing(index)
+```
+
+```{r}
+label_train <- as.numeric(train_xgb$STATUS)
+label_test <- as.numeric(test_xgb$STATUS)
+```
+
+```{r}
+train_matrix <- data.matrix(train_xgb[,-2])
+test_matrix <- data.matrix(test_xgb[,-2])
+# convert data to Dmatrix
+dtrain <- xgb.DMatrix(data = train_matrix, label = label_train)
+dtest <- xgb.DMatrix(data = test_matrix, label = label_test)
+```
+
+```{r}
+params <- list(booster = "gbtree",
+               objective = "binary:logistic",
+               eta=0.7, 
+               gamma=10, 
+               max_depth=10, 
+               min_child_weight=3, 
+               subsample=1, 
+               colsample_bytree=0.5)
+```
+
+
+```{r}
+xgbcv <- xgb.cv( params = params, 
+                 data = dtrain,
+                 nrounds = 1000, 
+                 showsd = T, 
+                 nfold = 10,
+                 stratified = T, 
+                 print_every_n = 50, 
+                 early_stopping_rounds = 20, 
+                 maximize = F)
+print(xgbcv)
+```
+
+```{r}
+xgb1 <- xgb.train (params = params, 
+                   data = dtrain, 
+                   nrounds = xgbcv$best_iteration, 
+                   watchlist = list(val=dtest,train=dtrain),
+                   print_every_n = 100, 
+                   early_stoping_rounds = 10, 
+                   maximize = F , 
+                   eval_metric = "error",
+                   verbosity = 0)
+
+xgbpred_prob <-predict(object = xgb1, newdata = dtest)
+xgbpred <- ifelse (xgbpred_prob > 0.45,1,0)
+
+```
+
+```{r}
+confmat_xgb <- confusionMatrix(as.factor(xgbpred), as.factor(label_test), positive = "1")
+confmat_xgb
+```
+```{r}
+confmat_rf <- confusionMatrix(pred_rf$result, 
+                                 test$STATUS,
+                                 mode = "prec_recall",
+                                 positive = "bad credit")
+
+eval_rf <- tidy(confmat_rf) %>% 
+  mutate(model = "Random Forest") %>% 
+  select(model, term, estimate) %>% 
+  filter(term %in% c("accuracy", "precision", "recall", "specificity"))
+
+confmat_xgb <- confusionMatrix(as.factor(xgbpred), as.factor(label_test), positive = "1")
+
+eval_xgb <- tidy(confmat_xgb) %>% 
+  mutate(model = "XGBoost") %>% 
+  select(model, term, estimate) %>% 
+  filter(term %in% c("accuracy", "precision", "recall", "specificity"))
+
+```
+
+After obtaining the performance of the XGBoost model, we will compare it with the performance of the random forest model.
+```{r}
+eval_result <- rbind(eval_rf, eval_xgb)
+eval_result
+```
+The evaluation metrics that we prioritize is recall because we want to minimize the possibility of a situation where the actual customer data is *bad credit* but predicted as *good credit*. 
+
+```{r}
+var_imp <- xgb.importance(model = xgb1,
+                          feature_names = dimnames(dtrain)[[2]])
+xgb.ggplot.importance(var_imp,top_n = 10) + 
+  theme_minimal()+
+  theme(legend.position = "none")
+```
+The graph above displays information about the 10 most influential variables in the model. Annual income and months balance are the two most important variables in this model.
+
+```{r}
+xgb_result <- data.frame(class1 = xgbpred_prob, actual = as.factor(label_test))
+
+auc_xgb <- roc_auc(data = xgb_result, truth = actual,class1) 
+value_roc_xgb <- prediction(predictions = xgbpred_prob,
+                        labels = label_test)
+
+# ROC curve
+plot(performance(value_roc_xgb, "tpr", "fpr"))
+
+```
+
+```{r}
+value_auc_xgb <- performance(value_roc_xgb, measure = "auc")
+value_auc_xgb@y.values
+```
+The AUC value obtained in this model is 0.84, meaning that the model can predict well the two target classes namely `good credit` and `bad credit`. It is hoped that this model can be used by banks to determine credit scoring by entering customer profile data, then the results obtained can be visualized as follows:
+
+```{r}
+explainer <- lime(train_matrix %>% as.data.frame(), xgb1)
+explanation <- explain(test_matrix[11:12,] %>% as.data.frame(),
+                             explainer, 
+                             labels = "1",
+                             n_features = 3,
+                             n_permutations = 5000,
+                             dist_fun = "manhattan",
+                             kernel_width = 0.75,
+                             feature_select = "highest_weights")
+
+plot_features(explanation)
+
+```
+
+The results of the visualization for customers 1 and 2 have a probability of 0.40 and 0.37 meaning that both customers will be categorized as `good credit'. Both customers have similar characteristics because their predictions are supported by the ownership model and total income.
+
